@@ -1,4 +1,3 @@
-cat > .github/workflows/claude-bug-fix.yml << 'EOF'
 name: Claude Bug Detection & Auto-Fix
 
 on:
@@ -70,4 +69,3 @@ jobs:
             - Create a new branch named fix/claude-auto-fix
             - Apply the fixes directly to the code
             - Open a pull request with a title and body describing every change made
-EOF
