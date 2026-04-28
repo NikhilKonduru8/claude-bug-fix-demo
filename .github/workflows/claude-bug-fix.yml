@@ -8,7 +8,6 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  id-token: write
 
 jobs:
   claude-review:
@@ -27,43 +26,82 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install pytest
-          pip install -r requirements.txt 2>/dev/null || true
+        run: pip install anthropic requests
 
-      - name: Run tests
+      - name: Get changed files
+        id: diff
+        run: |
+          git diff origin/main...HEAD -- '*.py' > diff.txt
+          cat diff.txt
+
+      - name: Run Claude review
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          pytest tests/ -v --tb=short 2>&1 | tee test_output.txt || true
+          python << 'PYEOF'
+          import anthropic
+          import os
+          import subprocess
 
-      - name: Claude Bug Review + Auto-Fix PR
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          prompt: |
-            You are a senior Python engineer performing an automated code review.
+          # Read the diff
+          with open("diff.txt") as f:
+              diff = f.read()
 
-            Review the changes in this pull request and do the following:
+          if not diff.strip():
+              print("No Python file changes found.")
+              exit(0)
 
-            STEP 1 — ANALYZE:
-            Look for any of the following issues in the changed Python files:
-            - Bugs and logic errors (off-by-one, wrong operators, bad conditionals)
-            - Security vulnerabilities (SQL injection, hardcoded secrets, unsafe eval/exec)
-            - Unhandled exceptions (division by zero, KeyError, IndexError, None dereference)
-            - Input validation gaps
-            - Any test failures shown in test_output.txt
+          # Call Claude
+          client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+          message = client.messages.create(
+              model="claude-opus-4-5",
+              max_tokens=4096,
+              messages=[
+                  {
+                      "role": "user",
+                      "content": f"""You are a senior Python engineer doing a code review.
 
-            STEP 2 — COMMENT:
-            Post a detailed review comment on the PR that includes:
-            - A summary of every issue found, with the exact file and line number
-            - Severity level for each (Critical / High / Medium / Low)
-            - A clear explanation of why it is a problem
-            - The recommended fix
+          Here is the git diff of the changes:
+          {diff}
 
-            STEP 3 — FIX & OPEN PR:
-            If any Critical or High severity issues are found:
-            - Create a new branch named fix/claude-auto-fix
-            - Apply the fixes directly to the code
-            - Open a pull request with a title and body describing every change made
+          Review this code and identify ALL bugs, security issues, and errors.
+          For each issue found, list:
+          - File name and line number
+          - Severity (Critical / High / Medium / Low)
+          - What the bug is
+          - How to fix it
+
+          Format your response as a clear markdown comment suitable for a GitHub PR."""
+                  }
+              ]
+          )
+
+          review = message.content[0].text
+          print("Claude review:", review)
+
+          # Post comment to PR
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+          token = os.environ["GH_TOKEN"]
+
+          import urllib.request
+          import json
+
+          comment_body = f"## Claude Code Review\n\n{review}"
+          data = json.dumps({"body": comment_body}).encode()
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+              data=data,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
+          urllib.request.urlopen(req)
+          print("Comment posted successfully!")
+          PYEOF
