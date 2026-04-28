@@ -1,5 +1,10 @@
 name: AI Auto-Debugger
-on: [push] # Triggers on every push
+on: [push]
+
+# ADD THIS SECTION:
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read    # Required to checkout your code
 
 jobs:
   analyze-code:
@@ -12,5 +17,4 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # This tells Claude what to do when it wakes up
-          prompt: "Analyze the changes in this push. If you find any logic errors or bugs, comment on the commit and explain how to fix them."
+          prompt: "Analyze the changes in this push. If you find any logic errors or bugs, explain how to fix them."
