@@ -3,10 +3,6 @@ name: Claude Bug Detection & Auto-Fix
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches:
-      - main
-      - dev
 
 permissions:
   contents: write
@@ -43,7 +39,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          use_bedrock: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             You are a senior Python engineer performing an automated code review.
 
