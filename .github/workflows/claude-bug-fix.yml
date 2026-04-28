@@ -1,0 +1,75 @@
+name: Claude Bug Detection & Auto-Fix
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  claude-review:
+    name: Claude Code Review & Auto-Fix
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history so Claude can see the full diff
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pytest
+          pip install -r requirements.txt 2>/dev/null || true
+
+      - name: Run tests (capture failures for context)
+        id: run_tests
+        run: |
+          pytest tests/ -v --tb=short 2>&1 | tee test_output.txt || true
+
+      - name: Claude Bug Review + Auto-Fix PR
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are a senior Python engineer performing an automated code review.
+
+            Review the changes in this pull request (or the latest push) and do the following:
+
+            STEP 1 — ANALYZE:
+            Look for any of the following issues in the changed Python files:
+            - Bugs and logic errors (off-by-one, wrong operators, bad conditionals)
+            - Security vulnerabilities (SQL injection, hardcoded secrets, unsafe eval/exec)
+            - Unhandled exceptions (division by zero, KeyError, IndexError, None dereference)
+            - Input validation gaps
+            - Any test failures shown in test_output.txt
+
+            STEP 2 — COMMENT:
+            Post a detailed review comment on the PR that includes:
+            - A summary of every issue found, with the exact file and line number
+            - Severity level for each (Critical / High / Medium / Low)
+            - A clear explanation of why it's a problem
+            - The recommended fix
+
+            STEP 3 — FIX & OPEN PR:
+            If any Critical or High severity issues are found:
+            - Create a new branch named fix/claude-auto-fix-<short-description>
+            - Apply the fixes directly to the code
+            - Open a pull request with:
+              - Title: "fix: Claude auto-fix for [brief description of issues]"
+              - Body listing every change made and why
+              - Reference to the original PR/commit that triggered this
+
+            Be precise. Only fix what is clearly a bug — do not refactor style or rename variables.
