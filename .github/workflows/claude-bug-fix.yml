@@ -28,18 +28,23 @@ jobs:
       - name: Install dependencies
         run: pip install openai requests
 
-      - name: Get changed files
+      - name: Get changed Python files
         run: |
           git diff origin/main...HEAD -- '*.py' > diff.txt
+          git diff origin/main...HEAD --name-only -- '*.py' > changed_files.txt
+          echo "Changed files:"
+          cat changed_files.txt
+          echo "Diff:"
           cat diff.txt
 
-      - name: Run AI review and send email
+      - name: Run AI review, send email, and open fix PR
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD_BRANCH: ${{ github.head_ref }}
           REPO: ${{ github.repository }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
@@ -49,128 +54,237 @@ jobs:
           import os
           import json
           import urllib.request
+          import urllib.error
           import smtplib
+          import subprocess
           from email.mime.text import MIMEText
           from email.mime.multipart import MIMEMultipart
 
-          # Read the diff
+          # ── helpers ──────────────────────────────────────────────────────────
+          def gh_request(path, data=None, method="POST"):
+              token = os.environ["GH_TOKEN"]
+              repo  = os.environ["REPO"]
+              url   = f"https://api.github.com/repos/{repo}{path}"
+              body  = json.dumps(data).encode() if data else None
+              req   = urllib.request.Request(
+                  url, data=body,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+                  method=method,
+              )
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read())
+
+          # ── read inputs ───────────────────────────────────────────────────────
           with open("diff.txt") as f:
               diff = f.read()
 
+          with open("changed_files.txt") as f:
+              changed_files = [l.strip() for l in f if l.strip()]
+
           if not diff.strip():
-              print("No Python file changes found.")
+              print("No Python file changes found — skipping.")
               exit(0)
 
-          # Call OpenAI Codex
+          # Read the actual contents of each changed file
+          file_contents = {}
+          for filepath in changed_files:
+              if os.path.exists(filepath):
+                  with open(filepath) as f:
+                      file_contents[filepath] = f.read()
+
+          # ── call OpenAI ───────────────────────────────────────────────────────
           client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+          files_block = "\n\n".join(
+              f"### {path}\n```python\n{contents}\n```"
+              for path, contents in file_contents.items()
+          )
+
           response = client.chat.completions.create(
               model="gpt-4o",
-              max_tokens=4096,
+              max_tokens=8096,
               messages=[
                   {
                       "role": "system",
-                      "content": "You are a senior Python engineer performing automated code reviews."
+                      "content": "You are a senior Python engineer performing automated code reviews and fixes."
                   },
                   {
                       "role": "user",
-                      "content": f"""Review this git diff and identify ALL bugs, security issues, and errors.
+                      "content": f"""You are reviewing a pull request. Here are the changed Python files:
 
-          For each issue found, list:
+          {files_block}
+
+          And here is the git diff:
+          {diff}
+
+          Do the following:
+
+          PART 1 — Write a detailed code review comment in markdown listing every bug found with:
           - File name and line number
-          - Severity (Critical / High / Medium / Low)
+          - Severity (Critical / High / Medium / Low)  
           - What the bug is
           - How to fix it
 
-          Format your response as a clear markdown comment suitable for a GitHub PR.
+          PART 2 — For each changed file that has bugs, provide the COMPLETE corrected file contents with ALL bugs fixed.
 
-          At the very end of your response, on its own line, write either:
+          Format your response EXACTLY like this:
+
+          REVIEW_START
+          <your full markdown review here>
+          REVIEW_END
+
+          FILES_START
+          FILE: path/to/file.py
+```python
+          <complete corrected file contents>
+```
+          FILE: path/to/another.py
+```python
+          <complete corrected file contents>
+```
+          FILES_END
+
+          At the very end write either:
           BUGS_FOUND: YES
           or
-          BUGS_FOUND: NO
-
-          Here is the diff:
-          {diff}"""
+          BUGS_FOUND: NO"""
                   }
               ]
           )
 
-          review = response.choices[0].message.content
-          print("Review:", review)
+          full_response = response.choices[0].message.content
+          print("AI Response:", full_response)
 
-          # Post comment to PR
+          # ── parse review ──────────────────────────────────────────────────────
+          review = ""
+          if "REVIEW_START" in full_response and "REVIEW_END" in full_response:
+              review = full_response.split("REVIEW_START")[1].split("REVIEW_END")[0].strip()
+          else:
+              review = full_response
+
+          bugs_found = "BUGS_FOUND: YES" in full_response
+
+          # ── parse fixed files ─────────────────────────────────────────────────
+          fixed_files = {}
+          if "FILES_START" in full_response and "FILES_END" in full_response:
+              files_section = full_response.split("FILES_START")[1].split("FILES_END")[0].strip()
+              parts = files_section.split("FILE:")
+              for part in parts:
+                  part = part.strip()
+                  if not part:
+                      continue
+                  lines = part.split("\n", 1)
+                  if len(lines) < 2:
+                      continue
+                  filepath = lines[0].strip()
+                  code_block = lines[1].strip()
+                  # strip ```python ... ``` wrapper
+                  if code_block.startswith("```python"):
+                      code_block = code_block[len("```python"):].strip()
+                  if code_block.startswith("```"):
+                      code_block = code_block[3:].strip()
+                  if code_block.endswith("```"):
+                      code_block = code_block[:-3].strip()
+                  fixed_files[filepath] = code_block
+
+          print(f"Fixed files parsed: {list(fixed_files.keys())}")
+
+          # ── post PR comment ───────────────────────────────────────────────────
           pr_number = os.environ["PR_NUMBER"]
-          repo = os.environ["REPO"]
-          token = os.environ["GH_TOKEN"]
-          pr_url = os.environ["PR_URL"]
-          pr_title = os.environ["PR_TITLE"]
+          pr_url    = os.environ["PR_URL"]
+          pr_title  = os.environ["PR_TITLE"]
+          repo      = os.environ["REPO"]
 
-          comment_body = f"## AI Code Review\n\n{review}"
-          data = json.dumps({"body": comment_body}).encode()
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
-              data=data,
-              headers={
-                  "Authorization": f"Bearer {token}",
-                  "Accept": "application/vnd.github+json",
-                  "Content-Type": "application/json"
-              },
-              method="POST"
-          )
-          urllib.request.urlopen(req)
-          print("Comment posted successfully!")
+          comment_body = f"## 🤖 AI Code Review\n\n{review}"
+          gh_request(f"/issues/{pr_number}/comments", {"body": comment_body})
+          print("Review comment posted!")
 
-          # Send email if bugs found
-          if "BUGS_FOUND: YES" in review:
-              print("Bugs found — sending email alert...")
-
-              email_address = os.environ["EMAIL_ADDRESS"]
+          # ── send email ────────────────────────────────────────────────────────
+          if bugs_found:
+              print("Sending email alert...")
+              email_address  = os.environ["EMAIL_ADDRESS"]
               email_password = os.environ["EMAIL_APP_PASSWORD"]
-              to_email = "nikhilkonduru8@gmail.com"
+              to_email       = "nikhilkonduru8@gmail.com"
 
               msg = MIMEMultipart("alternative")
               msg["Subject"] = f"🚨 AI found bugs in PR: {pr_title}"
-              msg["From"] = email_address
-              msg["To"] = to_email
-
-              plain = f"""AI Code Review found bugs in a pull request.
-
-          PR: {pr_title}
-          Link: {pr_url}
-
-          Review summary:
-          {review}
-          """
+              msg["From"]    = email_address
+              msg["To"]      = to_email
 
               html = f"""
-              <html>
-              <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
-                  <div style="background: #e53e3e; color: white; padding: 16px 24px; border-radius: 8px 8px 0 0;">
-                  <h2 style="margin:0">�� AI Bug Detection Alert</h2>
-                  </div>
-                  <div style="border: 1px solid #e2e8f0; padding: 24px; border-radius: 0 0 8px 8px;">
+              <html><body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;">
+                <div style="background:#e53e3e;color:white;padding:16px 24px;border-radius:8px 8px 0 0;">
+                  <h2 style="margin:0">🚨 AI Bug Detection Alert</h2>
+                </div>
+                <div style="border:1px solid #e2e8f0;padding:24px;border-radius:0 0 8px 8px;">
                   <p><strong>Repository:</strong> {repo}</p>
                   <p><strong>PR:</strong> <a href="{pr_url}">{pr_title}</a></p>
-                  <p><strong>Review findings:</strong></p>
-                  <div style="background: #f7fafc; padding: 16px; border-radius: 6px; white-space: pre-wrap; font-size: 14px;">
-                      {review.replace("BUGS_FOUND: YES", "").strip()}
+                  <p><strong>A fix PR has been opened automatically.</strong></p>
+                  <div style="background:#f7fafc;padding:16px;border-radius:6px;white-space:pre-wrap;font-size:14px;">
+                    {review}
                   </div>
                   <br>
-                  <a href="{pr_url}" style="background:#3182ce; color:white; padding:10px 20px; border-radius:6px; text-decoration:none;">
-                      View PR on GitHub
+                  <a href="{pr_url}" style="background:#3182ce;color:white;padding:10px 20px;border-radius:6px;text-decoration:none;">
+                    View Original PR
                   </a>
-                  </div>
-              </body>
-              </html>
+                </div>
+              </body></html>
               """
-
-              msg.attach(MIMEText(plain, "plain"))
               msg.attach(MIMEText(html, "html"))
 
               with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
                   server.login(email_address, email_password)
                   server.sendmail(email_address, to_email, msg.as_string())
+              print(f"Email sent to {to_email}!")
 
-              print(f"Email alert sent to {to_email}!")
+          # ── open fix PR ───────────────────────────────────────────────────────
+          if bugs_found and fixed_files:
+              print("Creating fix branch and PR...")
+
+              fix_branch = f"fix/auto-fix-pr-{pr_number}"
+
+              # configure git
+              subprocess.run(["git", "config", "user.email", "actions@github.com"], check=True)
+              subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=True)
+
+              # create fix branch from main
+              subprocess.run(["git", "checkout", "main"], check=True)
+              subprocess.run(["git", "checkout", "-b", fix_branch], check=True)
+
+              # write fixed files
+              for filepath, contents in fixed_files.items():
+                  os.makedirs(os.path.dirname(filepath), exist_ok=True) if os.path.dirname(filepath) else None
+                  with open(filepath, "w") as f:
+                      f.write(contents)
+                  print(f"Written fixed file: {filepath}")
+
+              # commit and push
+              subprocess.run(["git", "add", "-A"], check=True)
+              subprocess.run(["git", "commit", "-m", f"fix: auto-fix bugs found in PR #{pr_number}"], check=True)
+
+              token = os.environ["GH_TOKEN"]
+              remote = f"https://x-access-token:{token}@github.com/{repo}.git"
+              subprocess.run(["git", "push", remote, fix_branch], check=True)
+
+              # open the fix PR via GitHub API
+              fix_pr = gh_request("/pulls", {
+                  "title": f"fix: 🤖 Auto-fix bugs from PR #{pr_number}",
+                  "body": f"This PR was automatically generated by the AI code review agent.\n\nIt fixes all bugs found in PR #{pr_number}.\n\n## Bugs Fixed\n\n{review}",
+                  "head": fix_branch,
+                  "base": "main",
+              })
+
+              print(f"Fix PR opened: {fix_pr['html_url']}")
+
+              # comment on original PR with link to fix
+              gh_request(f"/issues/{pr_number}/comments", {
+                  "body": f"## ✅ Fix PR Opened\n\nI've automatically created a fix PR with all bugs corrected:\n👉 {fix_pr['html_url']}"
+              })
           else:
-              print("No bugs found — no email sent.")
+              print("No bugs found or no fixed files — skipping fix PR.")
           PYEOF
